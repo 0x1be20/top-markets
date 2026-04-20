@@ -156,17 +156,13 @@ button:disabled {
 
 .content-grid {
   display: grid;
-  grid-template-columns: 1.35fr 0.85fr;
+  grid-template-columns: 1fr;
   gap: 18px;
   margin-top: 18px;
 }
 
 .panel {
   padding: 22px;
-}
-
-.panel-large {
-  min-height: 540px;
 }
 
 .panel-full {
@@ -189,46 +185,73 @@ button:disabled {
   line-height: 1.6;
 }
 
-.chart-wrap {
-  position: relative;
-  height: 440px;
+.daily-pools {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
 }
 
-.top-movers {
-  display: grid;
-  gap: 12px;
-}
-
-.mover-card {
-  display: grid;
-  gap: 12px;
-  padding: 16px;
+.daily-pool-card {
+  padding: 18px;
   border: 1px solid rgba(13, 59, 102, 0.12);
   border-radius: 18px;
   background: rgba(255, 255, 255, 0.62);
 }
 
-.mover-head,
-.mover-metrics {
+.daily-pool-head {
   display: flex;
   justify-content: space-between;
-  gap: 12px;
-  align-items: baseline;
+  gap: 16px;
+  align-items: start;
 }
 
-.mover-head strong {
-  font-family: "Space Grotesk", sans-serif;
-  font-size: 22px;
-}
-
-.mover-metrics span {
-  color: var(--positive);
-  font-weight: 700;
-  font-size: 18px;
-}
-
-.mover-metrics small {
+.daily-date {
+  margin: 0 0 8px;
   color: var(--muted);
+  font-size: 13px;
+}
+
+.daily-pool-head strong {
+  font-family: "Space Grotesk", sans-serif;
+  font-size: 26px;
+}
+
+.daily-trigger {
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: rgba(13, 59, 102, 0.08);
+  color: var(--accent-deep);
+  font-size: 12px;
+  text-transform: uppercase;
+}
+
+.daily-meta {
+  margin: 10px 0 0;
+  color: var(--muted);
+  line-height: 1.6;
+  font-size: 14px;
+}
+
+.symbol-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.symbol-pill {
+  padding: 8px 10px;
+  border-radius: 999px;
+  background: rgba(255, 107, 53, 0.1);
+  color: var(--accent-deep);
+  font-family: "Space Grotesk", sans-serif;
+  font-size: 13px;
+}
+
+.symbol-pill-added {
+  background: linear-gradient(135deg, #ffb36b, #ff6b35);
+  color: white;
+  box-shadow: 0 10px 20px rgba(255, 107, 53, 0.24);
 }
 
 .table-wrap {
@@ -269,8 +292,7 @@ th {
 }
 
 @media (max-width: 1024px) {
-  .hero,
-  .content-grid {
+  .hero {
     grid-template-columns: 1fr;
   }
 
@@ -281,6 +303,10 @@ th {
 
   .stats-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .daily-pools {
+    grid-template-columns: 1fr;
   }
 }
 
@@ -297,9 +323,5 @@ th {
 
   .stats-grid {
     grid-template-columns: 1fr;
-  }
-
-  .chart-wrap {
-    height: 320px;
   }
 }

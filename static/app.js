@@ -1,22 +1,7 @@
-const state = {
-  chart: null,
-};
-
 function formatDateTime(value) {
   if (!value) return "-";
   return new Intl.DateTimeFormat("zh-CN", {
     year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  }).format(new Date(value));
-}
-
-function formatAxisTime(value) {
-  if (!value) return "";
-  return new Intl.DateTimeFormat("zh-CN", {
     month: "2-digit",
     day: "2-digit",
     hour: "2-digit",
@@ -38,24 +23,6 @@ function formatPercent(value) {
   const num = Number(value);
   const sign = num > 0 ? "+" : "";
   return `${sign}${formatNumber(num, 2)}%`;
-}
-
-function pickColor(index) {
-  const palette = [
-    "#ff6b35",
-    "#0d3b66",
-    "#7c9885",
-    "#c1121f",
-    "#3a86ff",
-    "#588157",
-    "#8338ec",
-    "#fb5607",
-    "#2a9d8f",
-    "#6d597a",
-    "#ef476f",
-    "#457b9d",
-  ];
-  return palette[index % palette.length];
 }
 
 async function fetchState() {
@@ -97,32 +64,6 @@ function renderStats(data) {
   document.getElementById("lastRunTrigger").textContent = data.schedule.last_run_trigger || "-";
 }
 
-function renderTopMovers(data) {
-  const container = document.getElementById("topMovers");
-  container.innerHTML = "";
-
-  if (!data.recent_top_movers.length) {
-    container.innerHTML = '<p class="empty-state">当前还没有最近一轮涨幅榜数据。</p>';
-    return;
-  }
-
-  for (const mover of data.recent_top_movers) {
-    const card = document.createElement("article");
-    card.className = "mover-card";
-    card.innerHTML = `
-      <div class="mover-head">
-        <strong>${mover.symbol.toUpperCase()}</strong>
-        <span>#${mover.rank}</span>
-      </div>
-      <div class="mover-metrics">
-        <span>${formatPercent(mover.change_pct)}</span>
-        <small>最新价 ${formatNumber(mover.last_price, 4)}</small>
-      </div>
-    `;
-    container.appendChild(card);
-  }
-}
-
 function renderTable(data) {
   const tbody = document.getElementById("candidateTableBody");
   tbody.innerHTML = "";
@@ -130,7 +71,7 @@ function renderTable(data) {
   if (!data.candidate_pool.length) {
     tbody.innerHTML = `
       <tr>
-        <td colspan="8" class="empty-state">候选池为空，服务会在第一次运行后填充。</td>
+        <td colspan="9" class="empty-state">候选池为空，服务会在第一次运行后填充。</td>
       </tr>
     `;
     return;
@@ -146,103 +87,56 @@ function renderTable(data) {
       <td>${formatNumber(row.latest_price, 4)}</td>
       <td class="${(row.change_from_entry_pct || 0) >= 0 ? "positive" : "negative"}">${formatPercent(row.change_from_entry_pct)}</td>
       <td class="${(row.last_change_pct || 0) >= 0 ? "positive" : "negative"}">${formatPercent(row.last_change_pct)}</td>
+      <td>${row.consecutive_failure_count ?? 0}</td>
       <td>${row.last_filter_status ? `${row.last_filter_status} / ${formatDateTime(row.last_filter_at)}` : "-"}</td>
     `;
     tbody.appendChild(tr);
   }
 }
 
-function renderChart(data) {
-  const ctx = document.getElementById("normalizedChart");
-  const datasets = data.normalized_series
-    .filter((item) => item.points.length > 0)
-    .map((item, index) => ({
-      label: item.symbol.toUpperCase(),
-      data: item.points.map((point) => ({ x: new Date(point.t).getTime(), y: point.y, t: point.t, price: point.price })),
-      borderColor: pickColor(index),
-      backgroundColor: pickColor(index),
-      borderWidth: 2,
-      pointRadius: 0,
-      tension: 0.22,
-    }));
+function renderDailyPools(data) {
+  const container = document.getElementById("dailyPools");
+  container.innerHTML = "";
 
-  if (state.chart) {
-    state.chart.destroy();
+  if (!data.daily_candidate_pools.length) {
+    container.innerHTML = '<p class="empty-state">当前还没有可展示的每日候选池快照。</p>';
+    return;
   }
 
-  state.chart = new Chart(ctx, {
-    type: "line",
-    data: { datasets },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      interaction: {
-        mode: "nearest",
-        intersect: false,
-      },
-      plugins: {
-        legend: {
-          labels: {
-            usePointStyle: true,
-            boxWidth: 10,
-            font: {
-              family: "Space Grotesk, Noto Sans SC, sans-serif",
-            },
-          },
-        },
-        tooltip: {
-          callbacks: {
-            title(items) {
-              if (!items.length) return "";
-              return formatDateTime(items[0].raw.t);
-            },
-            label(context) {
-              const raw = context.raw;
-              return `${context.dataset.label}: ${formatNumber(raw.y, 2)} | 价格 ${formatNumber(raw.price, 4)}`;
-            },
-            afterLabel(context) {
-              return formatDateTime(context.raw.t);
-            },
-          },
-        },
-      },
-      scales: {
-        x: {
-          type: "linear",
-          title: {
-            display: true,
-            text: "时间",
-          },
-          ticks: {
-            callback(value) {
-              return formatAxisTime(Number(value));
-            },
-            maxTicksLimit: 8,
-          },
-          grid: {
-            color: "rgba(13, 59, 102, 0.08)",
-          },
-        },
-        y: {
-          title: {
-            display: true,
-            text: "归一化值（首点 = 100）",
-          },
-          grid: {
-            color: "rgba(13, 59, 102, 0.08)",
-          },
-        },
-      },
-    },
-  });
+  for (const item of data.daily_candidate_pools) {
+    const card = document.createElement("article");
+    card.className = "daily-pool-card";
+    const addedSet = new Set(item.added_symbols);
+    const symbols = item.symbols
+      .map((symbol) => {
+        const isAdded = addedSet.has(symbol);
+        return `<span class="symbol-pill ${isAdded ? "symbol-pill-added" : ""}">${symbol.toUpperCase()}</span>`;
+      })
+      .join("");
+    const added = item.added_symbols.length ? item.added_symbols.map((symbol) => symbol.toUpperCase()).join(", ") : "-";
+    const removed = item.removed_symbols.length ? item.removed_symbols.map((symbol) => symbol.toUpperCase()).join(", ") : "-";
+    card.innerHTML = `
+      <div class="daily-pool-head">
+        <div>
+          <p class="daily-date">${item.date}</p>
+          <strong>${item.pool_size} 个币种</strong>
+        </div>
+        <span class="daily-trigger">${item.trigger || "-"}</span>
+      </div>
+      <p class="daily-meta">运行时间 ${formatDateTime(item.run_at)}</p>
+      <p class="daily-meta">新增 ${added}</p>
+      <p class="daily-meta">移除 ${removed}</p>
+      <div class="symbol-pills">${symbols}</div>
+    `;
+    container.appendChild(card);
+  }
 }
 
 async function loadDashboard() {
   const data = await fetchState();
   renderStats(data);
-  renderTopMovers(data);
   renderTable(data);
-  renderChart(data);
+  renderDailyPools(data);
 }
 
 document.getElementById("refreshButton").addEventListener("click", triggerUpdate);

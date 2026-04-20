@@ -20,6 +20,10 @@ import requests
 LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 SCHEDULE_HOUR = 8
 DISPLAY_INTERVAL = "15m"
+MIN_HOLD_DAYS = 10
+BREAKOUT_LOOKBACK_DAYS = 7
+MAX_CONSECUTIVE_FAILURES = 3
+DEFAULT_BACKFILL_DAYS = 20
 ASCII_SYMBOL_RE = re.compile(r"^[a-z0-9]+$")
 BINANCE_FUTURES_KLINES_URL = "https://fapi.binance.com/fapi/v1/klines"
 KLINE_COLUMNS = [
@@ -66,6 +70,7 @@ def from_iso(value: str | None) -> datetime | None:
 class CandidateFilterResult:
     passed: bool
     latest_close: float | None
+    current_day_high: float | None
     reference_high: float | None
     latest_at: datetime | None
     reason: str
@@ -305,7 +310,7 @@ class MarketPoolService:
 
         latest_schedule = self._latest_schedule_time(now_local())
         if not has_pool:
-            self.backfill_days(days=7, include_now=True)
+            self.backfill_days(days=DEFAULT_BACKFILL_DAYS, include_now=True)
             return
         if last_run_at is None or last_run_at < latest_schedule:
             self.run_update(trigger="catchup", run_at=latest_schedule)
@@ -405,7 +410,7 @@ class MarketPoolService:
         def load_one(symbol: str) -> tuple[str, pd.DataFrame | None]:
             return symbol, self._fetch_hourly_frame(symbol, start, end)
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
             futures = [executor.submit(load_one, symbol) for symbol in symbols]
             for idx, future in enumerate(concurrent.futures.as_completed(futures), start=1):
                 symbol, df = future.result()
@@ -461,18 +466,24 @@ class MarketPoolService:
 
     def _entry_needs_filter(self, entry: dict[str, Any], run_at: datetime) -> bool:
         added_at = from_iso(entry.get("added_at"))
-        anchor = from_iso(entry.get("last_filter_at")) or added_at
-        if not added_at or not anchor:
+        last_filter_at = from_iso(entry.get("last_filter_at"))
+        if not added_at:
             return False
-        return run_at - anchor >= timedelta(days=7)
+        if run_at - added_at < timedelta(days=MIN_HOLD_DAYS):
+            return False
+        if last_filter_at is None:
+            return True
+        return last_filter_at.date() < run_at.date()
 
     def _evaluate_breakout(self, symbol: str, run_at: datetime) -> CandidateFilterResult:
-        start = run_at - timedelta(days=8)
+        day_start = run_at.replace(hour=0, minute=0, second=0, microsecond=0)
+        start = day_start - timedelta(days=BREAKOUT_LOOKBACK_DAYS)
         df = self.market_data.get_data(symbol, "1h", start, run_at, silent=True)
         if df.empty:
             return CandidateFilterResult(
                 passed=True,
                 latest_close=None,
+                current_day_high=None,
                 reference_high=None,
                 latest_at=None,
                 reason="missing_data",
@@ -481,12 +492,13 @@ class MarketPoolService:
         df = df.sort_index()
         latest = df.iloc[-1]
         latest_at = ensure_local(df.index[-1].to_pydatetime())
-        reference_since = latest_at - timedelta(days=7)
-        reference_df = df[(df.index >= reference_since) & (df.index < df.index[-1])]
-        if reference_df.empty:
+        reference_df = df[(df.index >= start) & (df.index < day_start)]
+        current_day_df = df[df.index >= day_start]
+        if reference_df.empty or current_day_df.empty:
             return CandidateFilterResult(
                 passed=True,
                 latest_close=float(latest["close"]),
+                current_day_high=float(current_day_df["high"].max()) if not current_day_df.empty else None,
                 reference_high=None,
                 latest_at=latest_at,
                 reason="insufficient_window",
@@ -494,9 +506,11 @@ class MarketPoolService:
 
         reference_high = float(reference_df["high"].max())
         latest_close = float(latest["close"])
+        current_day_high = float(current_day_df["high"].max())
         return CandidateFilterResult(
-            passed=latest_close > reference_high,
+            passed=current_day_high > reference_high,
             latest_close=latest_close,
+            current_day_high=current_day_high,
             reference_high=reference_high,
             latest_at=latest_at,
             reason="ok",
@@ -525,6 +539,7 @@ class MarketPoolService:
                         "last_filter_at": None,
                         "last_filter_status": None,
                         "last_breakout_high": None,
+                        "consecutive_failure_count": 0,
                     }
                     pool[symbol] = entry
                     added_symbols.append(symbol)
@@ -543,12 +558,19 @@ class MarketPoolService:
 
                 result = self._evaluate_breakout(symbol, run_at)
                 entry["last_filter_at"] = to_iso(run_at)
-                entry["last_filter_status"] = "passed" if result.passed else "removed"
                 entry["last_breakout_high"] = result.reference_high
+                entry["last_day_high"] = result.current_day_high
                 entry["last_breakout_checked_at"] = to_iso(result.latest_at)
                 if result.latest_close is not None:
                     entry["last_price"] = result.latest_close
-                if not result.passed:
+                if result.passed:
+                    entry["consecutive_failure_count"] = 0
+                    entry["last_filter_status"] = "passed"
+                else:
+                    entry["consecutive_failure_count"] = int(entry.get("consecutive_failure_count", 0)) + 1
+                    entry["last_filter_status"] = "failed"
+                if int(entry.get("consecutive_failure_count", 0)) >= MAX_CONSECUTIVE_FAILURES:
+                    entry["last_filter_status"] = "removed"
                     removed_symbols.append(symbol)
                     del pool[symbol]
 
@@ -558,6 +580,8 @@ class MarketPoolService:
                 "added_symbols": added_symbols,
                 "removed_symbols": removed_symbols,
                 "top_movers": movers,
+                "pool_symbols": sorted(pool.keys()),
+                "pool_size": len(pool),
             }
             history = self.state.setdefault("history", [])
             history.insert(0, history_item)
@@ -692,12 +716,11 @@ class MarketPoolService:
             "latest_point_at": to_iso(ensure_local(df.index[-1].to_pydatetime())),
         }
 
-    def _build_pool_rows(self, pool: dict[str, Any], snapshots: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    def _build_pool_rows(self, pool: dict[str, Any]) -> list[dict[str, Any]]:
         rows = []
         for symbol, entry in pool.items():
             added_at = from_iso(entry.get("added_at"))
-            snapshot = snapshots.get(symbol, {})
-            latest_price = snapshot.get("latest_price", entry.get("last_price"))
+            latest_price = entry.get("last_price")
             entry_price = float(entry.get("entry_price") or 0) if entry.get("entry_price") is not None else None
             change_from_entry_pct = None
             if entry_price and latest_price:
@@ -716,6 +739,7 @@ class MarketPoolService:
                     "last_change_pct": round(float(entry.get("last_change_pct", 0)), 2) if entry.get("last_change_pct") is not None else None,
                     "last_filter_at": entry.get("last_filter_at"),
                     "last_filter_status": entry.get("last_filter_status"),
+                    "consecutive_failure_count": int(entry.get("consecutive_failure_count", 0)),
                 }
             )
         rows.sort(key=lambda item: (item["change_from_entry_pct"] is None, -(item["change_from_entry_pct"] or 0)))
@@ -726,34 +750,32 @@ class MarketPoolService:
             state = copy.deepcopy(self.state)
 
         pool = state.get("pool", {})
-        snapshots: dict[str, dict[str, Any]] = {}
-        series_payload: list[dict[str, Any]] = []
-
-        def build_snapshot(item: tuple[str, dict[str, Any]]) -> tuple[str, dict[str, Any]]:
-            symbol, entry = item
-            return symbol, self._build_symbol_snapshot(symbol, entry)
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-            futures = [executor.submit(build_snapshot, item) for item in pool.items()]
-            for future in concurrent.futures.as_completed(futures):
-                symbol, snapshot = future.result()
-                snapshots[symbol] = snapshot
-
-        for symbol in sorted(snapshots):
-            snapshot = snapshots[symbol]
-            series_payload.append(
+        pool_rows = self._build_pool_rows(pool)
+        recent_run = state.get("history", [{}])[0] if state.get("history") else {}
+        daily_candidate_pools: list[dict[str, Any]] = []
+        seen_dates: set[str] = set()
+        for item in state.get("history", []):
+            run_at = item.get("run_at")
+            if not run_at:
+                continue
+            day_key = run_at[:10]
+            if day_key in seen_dates:
+                continue
+            pool_symbols = item.get("pool_symbols")
+            if pool_symbols is None:
+                continue
+            seen_dates.add(day_key)
+            daily_candidate_pools.append(
                 {
-                    "symbol": symbol,
-                    "base_price": snapshot["base_price"],
-                    "latest_price": snapshot["latest_price"],
-                    "latest_change_from_entry_pct": snapshot["latest_change_from_entry_pct"],
-                    "latest_point_at": snapshot["latest_point_at"],
-                    "points": snapshot["series"],
+                    "date": day_key,
+                    "run_at": run_at,
+                    "trigger": item.get("trigger"),
+                    "pool_size": item.get("pool_size", len(pool_symbols)),
+                    "symbols": pool_symbols,
+                    "added_symbols": item.get("added_symbols", []),
+                    "removed_symbols": item.get("removed_symbols", []),
                 }
             )
-
-        pool_rows = self._build_pool_rows(pool, snapshots)
-        recent_run = state.get("history", [{}])[0] if state.get("history") else {}
 
         return {
             "generated_at": to_iso(now_local()),
@@ -761,14 +783,18 @@ class MarketPoolService:
                 "timezone": "Asia/Shanghai",
                 "daily_run_time": "08:00",
                 "display_interval": DISPLAY_INTERVAL,
+                "min_hold_days": MIN_HOLD_DAYS,
+                "breakout_lookback_days": BREAKOUT_LOOKBACK_DAYS,
+                "max_consecutive_failures": MAX_CONSECUTIVE_FAILURES,
                 "last_run_at": state.get("last_run_at"),
                 "last_run_trigger": state.get("last_run_trigger"),
                 "next_run_at": state.get("next_run_at"),
             },
             "candidate_pool": pool_rows,
-            "normalized_series": series_payload,
+            "normalized_series": [],
             "recent_top_movers": recent_run.get("top_movers", []),
             "recent_history": state.get("history", [])[:10],
+            "daily_candidate_pools": daily_candidate_pools,
         }
 
     def get_tradingview_watchlist_text(self) -> str:

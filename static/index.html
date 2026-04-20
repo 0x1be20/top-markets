@@ -11,7 +11,6 @@
       rel="stylesheet"
     />
     <link rel="stylesheet" href="/styles.css" />
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
   </head>
   <body>
     <div class="page-shell">
@@ -20,7 +19,7 @@
           <p class="eyebrow">Momentum Candidate Pool</p>
           <h1>近期热门币种候选池</h1>
           <p class="hero-copy">
-            每天早上 8:00 拉取过去 24 小时涨幅最高的前 10 个 USDT 永续币种，加入候选池。每满 7 天做一次突破过滤，未站上前 7 天高点的币种会被移除。
+            每天早上 8:00 拉取过去 24 小时涨幅最高的前 10 个 USDT 永续币种，加入候选池。币种至少保留 10 天；之后按天检查，当天 high 若没有突破前 7 天高点则记一次失败，连续 3 次失败才移除。
           </p>
         </div>
         <div class="hero-actions">
@@ -50,34 +49,11 @@
       </section>
 
       <main class="content-grid">
-        <section class="panel panel-large">
-          <div class="panel-header">
-            <div>
-              <p class="panel-kicker">Normalized Chart</p>
-              <h2>归一化价格曲线（15m 实时时间轴）</h2>
-            </div>
-            <p class="panel-note">以各币种入池后的首个 15 分钟价格点归一化为 100，横轴按真实时间显示。</p>
-          </div>
-          <div class="chart-wrap">
-            <canvas id="normalizedChart"></canvas>
-          </div>
-        </section>
-
-        <section class="panel">
-          <div class="panel-header">
-            <div>
-              <p class="panel-kicker">Top Movers</p>
-              <h2>最近一轮 24h 涨幅前 10</h2>
-            </div>
-          </div>
-          <div id="topMovers" class="top-movers"></div>
-        </section>
-
         <section class="panel panel-full">
           <div class="panel-header">
             <div>
-              <p class="panel-kicker">Candidate Pool</p>
-              <h2>候选池列表</h2>
+              <p class="panel-kicker">Current Pool</p>
+              <h2>当前候选池</h2>
             </div>
           </div>
           <div class="table-wrap">
@@ -91,12 +67,24 @@
                   <th>最新价</th>
                   <th>相对入池涨跌</th>
                   <th>最近 24h 涨幅</th>
+                  <th>连续失败次数</th>
                   <th>最近过滤</th>
                 </tr>
               </thead>
               <tbody id="candidateTableBody"></tbody>
             </table>
           </div>
+        </section>
+
+        <section class="panel panel-full">
+          <div class="panel-header">
+            <div>
+              <p class="panel-kicker">Daily Snapshots</p>
+              <h2>每天的候选池</h2>
+            </div>
+            <p class="panel-note">按日期展示每天运行结束后的候选池快照。</p>
+          </div>
+          <div id="dailyPools" class="daily-pools"></div>
         </section>
       </main>
     </div>
