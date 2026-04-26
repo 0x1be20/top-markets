@@ -5,6 +5,7 @@ import logging
 import mimetypes
 import signal
 import sys
+import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -108,6 +109,11 @@ class AppHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+class AppServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
 def main() -> int:
     logging.basicConfig(
         level=logging.INFO,
@@ -123,13 +129,12 @@ def main() -> int:
             port = int(sys.argv[1])
 
     SERVICE.start()
-    httpd = ThreadingHTTPServer(("0.0.0.0", port), AppHandler)
+    httpd = AppServer(("0.0.0.0", port), AppHandler)
     logging.info("serving on http://127.0.0.1:%s", port)
 
     def shutdown_handler(signum, frame) -> None:  # noqa: ARG001
         logging.info("shutting down")
-        SERVICE.stop()
-        httpd.shutdown()
+        threading.Thread(target=httpd.shutdown, daemon=True).start()
 
     signal.signal(signal.SIGINT, shutdown_handler)
     signal.signal(signal.SIGTERM, shutdown_handler)
@@ -138,6 +143,7 @@ def main() -> int:
         httpd.serve_forever()
     finally:
         SERVICE.stop()
+        httpd.server_close()
 
     return 0
 
