@@ -21,7 +21,8 @@ LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 SCHEDULE_HOUR = 8
 DISPLAY_INTERVAL = "15m"
 MIN_HOLD_DAYS = 10
-BREAKOUT_LOOKBACK_DAYS = 7
+BREAKOUT_RECENT_DAYS = 3
+BREAKOUT_REFERENCE_DAYS = 8
 MAX_CONSECUTIVE_FAILURES = 3
 DEFAULT_BACKFILL_DAYS = 20
 ASCII_SYMBOL_RE = re.compile(r"^[a-z0-9]+$")
@@ -70,7 +71,7 @@ def from_iso(value: str | None) -> datetime | None:
 class CandidateFilterResult:
     passed: bool
     latest_close: float | None
-    current_day_high: float | None
+    recent_high: float | None
     reference_high: float | None
     latest_at: datetime | None
     reason: str
@@ -237,6 +238,7 @@ class MarketPoolService:
         self._scheduler_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._exchange_info_cache: dict[str, Any] = {"symbols": set(), "fetched_at": None}
+        self._ticker_cache: dict[str, Any] = {"tickers": {}, "fetched_at": None}
 
     def _default_state(self) -> dict[str, Any]:
         return {
@@ -357,12 +359,16 @@ class MarketPoolService:
                 base_symbols.append(base_symbol)
         return sorted(set(base_symbols))
 
-    def fetch_top_movers(self, limit: int = 10) -> list[dict[str, Any]]:
+    def _ticker_24hr_map(self) -> dict[str, dict[str, float]]:
+        cached_at = self._ticker_cache.get("fetched_at")
+        if cached_at and now_local() - cached_at < timedelta(seconds=30):
+            return self._ticker_cache["tickers"]
+
         valid_symbols = self._valid_symbols()
         response = requests.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=15)
         response.raise_for_status()
 
-        movers = []
+        tickers: dict[str, dict[str, float]] = {}
         for item in response.json():
             symbol = item.get("symbol")
             if symbol not in valid_symbols:
@@ -371,18 +377,27 @@ class MarketPoolService:
             if not ASCII_SYMBOL_RE.fullmatch(base_symbol):
                 continue
             try:
-                change_pct = float(item.get("priceChangePercent", 0))
-                last_price = float(item.get("lastPrice", 0))
-                quote_volume = float(item.get("quoteVolume", 0))
+                tickers[base_symbol] = {
+                    "change_pct": float(item.get("priceChangePercent", 0)),
+                    "last_price": float(item.get("lastPrice", 0)),
+                    "quote_volume": float(item.get("quoteVolume", 0)),
+                }
             except (TypeError, ValueError):
                 continue
+
+        self._ticker_cache = {"tickers": tickers, "fetched_at": now_local()}
+        return tickers
+
+    def fetch_top_movers(self, limit: int = 10) -> list[dict[str, Any]]:
+        movers = []
+        for base_symbol, ticker in self._ticker_24hr_map().items():
             movers.append(
                 {
                     "symbol": base_symbol,
-                    "contract_symbol": symbol,
-                    "change_pct": change_pct,
-                    "last_price": last_price,
-                    "quote_volume": quote_volume,
+                    "contract_symbol": f"{base_symbol.upper()}USDT",
+                    "change_pct": ticker["change_pct"],
+                    "last_price": ticker["last_price"],
+                    "quote_volume": ticker["quote_volume"],
                 }
             )
 
@@ -476,14 +491,14 @@ class MarketPoolService:
         return last_filter_at.date() < run_at.date()
 
     def _evaluate_breakout(self, symbol: str, run_at: datetime) -> CandidateFilterResult:
-        day_start = run_at.replace(hour=0, minute=0, second=0, microsecond=0)
-        start = day_start - timedelta(days=BREAKOUT_LOOKBACK_DAYS)
-        df = self.market_data.get_data(symbol, "1h", start, run_at, silent=True)
+        recent_start = run_at - timedelta(days=BREAKOUT_RECENT_DAYS)
+        reference_start = run_at - timedelta(days=BREAKOUT_REFERENCE_DAYS)
+        df = self.market_data.get_data(symbol, "1h", reference_start, run_at, silent=True)
         if df.empty:
             return CandidateFilterResult(
                 passed=True,
                 latest_close=None,
-                current_day_high=None,
+                recent_high=None,
                 reference_high=None,
                 latest_at=None,
                 reason="missing_data",
@@ -492,13 +507,13 @@ class MarketPoolService:
         df = df.sort_index()
         latest = df.iloc[-1]
         latest_at = ensure_local(df.index[-1].to_pydatetime())
-        reference_df = df[(df.index >= start) & (df.index < day_start)]
-        current_day_df = df[df.index >= day_start]
-        if reference_df.empty or current_day_df.empty:
+        reference_df = df[(df.index >= reference_start) & (df.index < recent_start)]
+        recent_df = df[df.index >= recent_start]
+        if reference_df.empty or recent_df.empty:
             return CandidateFilterResult(
                 passed=True,
                 latest_close=float(latest["close"]),
-                current_day_high=float(current_day_df["high"].max()) if not current_day_df.empty else None,
+                recent_high=float(recent_df["high"].max()) if not recent_df.empty else None,
                 reference_high=None,
                 latest_at=latest_at,
                 reason="insufficient_window",
@@ -506,11 +521,11 @@ class MarketPoolService:
 
         reference_high = float(reference_df["high"].max())
         latest_close = float(latest["close"])
-        current_day_high = float(current_day_df["high"].max())
+        recent_high = float(recent_df["high"].max())
         return CandidateFilterResult(
-            passed=current_day_high > reference_high,
+            passed=recent_high > reference_high,
             latest_close=latest_close,
-            current_day_high=current_day_high,
+            recent_high=recent_high,
             reference_high=reference_high,
             latest_at=latest_at,
             reason="ok",
@@ -559,7 +574,8 @@ class MarketPoolService:
                 result = self._evaluate_breakout(symbol, run_at)
                 entry["last_filter_at"] = to_iso(run_at)
                 entry["last_breakout_high"] = result.reference_high
-                entry["last_day_high"] = result.current_day_high
+                entry["last_recent_high"] = result.recent_high
+                entry["last_day_high"] = result.recent_high
                 entry["last_breakout_checked_at"] = to_iso(result.latest_at)
                 if result.latest_close is not None:
                     entry["last_price"] = result.latest_close
@@ -593,9 +609,20 @@ class MarketPoolService:
 
         return history_item
 
+    def _history_item_for_run_at(self, run_at: datetime) -> dict[str, Any] | None:
+        run_at_iso = to_iso(run_at)
+        with self.lock:
+            for item in self.state.get("history", []):
+                if item.get("run_at") == run_at_iso:
+                    return copy.deepcopy(item)
+        return None
+
     def run_update(self, trigger: str = "manual", run_at: datetime | None = None) -> dict[str, Any]:
-        run_at = ensure_local(run_at) or now_local()
-        movers = self.fetch_top_movers(limit=10)
+        run_at = ensure_local(run_at) or self._latest_schedule_time(now_local())
+        existing = self._history_item_for_run_at(run_at)
+        if existing is not None:
+            return existing
+        movers = self.fetch_top_movers_at(run_at, limit=10)
         return self._apply_update(movers, trigger, run_at)
 
     def reset_state(self) -> None:
@@ -716,11 +743,13 @@ class MarketPoolService:
             "latest_point_at": to_iso(ensure_local(df.index[-1].to_pydatetime())),
         }
 
-    def _build_pool_rows(self, pool: dict[str, Any]) -> list[dict[str, Any]]:
+    def _build_pool_rows(self, pool: dict[str, Any], tickers: dict[str, dict[str, float]] | None = None) -> list[dict[str, Any]]:
         rows = []
         for symbol, entry in pool.items():
             added_at = from_iso(entry.get("added_at"))
-            latest_price = entry.get("last_price")
+            ticker = tickers.get(symbol) if tickers else None
+            latest_price = ticker.get("last_price") if ticker else entry.get("last_price")
+            last_change_pct = ticker.get("change_pct") if ticker else entry.get("last_change_pct")
             entry_price = float(entry.get("entry_price") or 0) if entry.get("entry_price") is not None else None
             change_from_entry_pct = None
             if entry_price and latest_price:
@@ -736,7 +765,7 @@ class MarketPoolService:
                     "change_from_entry_pct": change_from_entry_pct,
                     "entry_rank": entry.get("entry_rank"),
                     "last_rank": entry.get("last_rank"),
-                    "last_change_pct": round(float(entry.get("last_change_pct", 0)), 2) if entry.get("last_change_pct") is not None else None,
+                    "last_change_pct": round(float(last_change_pct), 2) if last_change_pct is not None else None,
                     "last_filter_at": entry.get("last_filter_at"),
                     "last_filter_status": entry.get("last_filter_status"),
                     "consecutive_failure_count": int(entry.get("consecutive_failure_count", 0)),
@@ -750,7 +779,12 @@ class MarketPoolService:
             state = copy.deepcopy(self.state)
 
         pool = state.get("pool", {})
-        pool_rows = self._build_pool_rows(pool)
+        try:
+            tickers = self._ticker_24hr_map()
+        except Exception:
+            self.logger.warning("failed to refresh live ticker prices for dashboard", exc_info=True)
+            tickers = {}
+        pool_rows = self._build_pool_rows(pool, tickers=tickers)
         recent_run = state.get("history", [{}])[0] if state.get("history") else {}
         daily_candidate_pools: list[dict[str, Any]] = []
         seen_dates: set[str] = set()
@@ -784,7 +818,8 @@ class MarketPoolService:
                 "daily_run_time": "08:00",
                 "display_interval": DISPLAY_INTERVAL,
                 "min_hold_days": MIN_HOLD_DAYS,
-                "breakout_lookback_days": BREAKOUT_LOOKBACK_DAYS,
+                "breakout_recent_days": BREAKOUT_RECENT_DAYS,
+                "breakout_reference_days": BREAKOUT_REFERENCE_DAYS,
                 "max_consecutive_failures": MAX_CONSECUTIVE_FAILURES,
                 "last_run_at": state.get("last_run_at"),
                 "last_run_trigger": state.get("last_run_trigger"),
