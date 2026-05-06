@@ -25,6 +25,8 @@ BREAKOUT_RECENT_DAYS = 3
 BREAKOUT_REFERENCE_DAYS = 8
 MAX_CONSECUTIVE_FAILURES = 3
 DEFAULT_BACKFILL_DAYS = 20
+KLINE_BACKFILL_WORKERS = 1
+KLINE_REQUEST_DELAY_SECONDS = 0.12
 ASCII_SYMBOL_RE = re.compile(r"^[a-z0-9]+$")
 BINANCE_FUTURES_KLINES_URL = "https://fapi.binance.com/fapi/v1/klines"
 KLINE_COLUMNS = [
@@ -86,6 +88,20 @@ class MarketDataClient:
     def _cache_path(self, symbol: str, interval: str) -> Path:
         return self.cache_dir / f"{symbol.lower()}_{interval}.csv"
 
+    def _normalize_time_column(self, values: pd.Series) -> pd.Series:
+        def parse_one(value: Any) -> pd.Timestamp:
+            if isinstance(value, (int, float)) or (isinstance(value, str) and value.isdigit()):
+                numeric_value = float(value)
+                if numeric_value >= 10**17:
+                    return pd.to_datetime(numeric_value, unit="ns", utc=True, errors="coerce")
+                if numeric_value >= 10**14:
+                    return pd.to_datetime(numeric_value, unit="us", utc=True, errors="coerce")
+                return pd.to_datetime(numeric_value, unit="ms", utc=True, errors="coerce")
+            return pd.to_datetime(value, utc=True, errors="coerce")
+
+        parsed = values.map(parse_one)
+        return parsed.dt.tz_convert(LOCAL_TZ.key)
+
     def _normalize_frame(self, df: pd.DataFrame) -> pd.DataFrame:
         if df is None or df.empty:
             return pd.DataFrame(columns=KLINE_COLUMNS)
@@ -96,16 +112,11 @@ class MarketDataClient:
             if column in frame.columns:
                 frame[column] = pd.to_numeric(frame[column], errors="coerce")
         if "time" in frame.columns:
-            frame["time"] = pd.to_datetime(frame["time"], utc=True, errors="coerce")
-            if getattr(frame["time"].dt, "tz", None) is None:
-                frame["time"] = frame["time"].dt.tz_localize("UTC")
-            frame["time"] = frame["time"].dt.tz_convert(LOCAL_TZ.key)
+            frame["time"] = self._normalize_time_column(frame["time"])
         if "end_time" in frame.columns:
-            frame["end_time"] = pd.to_datetime(frame["end_time"], utc=True, errors="coerce")
-            if getattr(frame["end_time"].dt, "tz", None) is None:
-                frame["end_time"] = frame["end_time"].dt.tz_localize("UTC")
-            frame["end_time"] = frame["end_time"].dt.tz_convert(LOCAL_TZ.key)
+            frame["end_time"] = self._normalize_time_column(frame["end_time"])
         frame = frame.dropna(subset=["time", "close", "high"])
+        frame = frame[frame["time"] >= pd.Timestamp("2017-01-01", tz=LOCAL_TZ.key)]
         frame = frame.sort_values("time")
         frame = frame.drop_duplicates(subset=["time"], keep="last")
         frame = frame.set_index("time", drop=False)
@@ -153,9 +164,33 @@ class MarketDataClient:
             payload: Any = None
             for attempt in range(5):
                 try:
+                    time.sleep(KLINE_REQUEST_DELAY_SECONDS)
                     response = requests.get(BINANCE_FUTURES_KLINES_URL, params=params, timeout=20)
                     response.raise_for_status()
                     payload = response.json()
+                except requests.HTTPError as exc:
+                    status_code = exc.response.status_code if exc.response is not None else None
+                    if status_code == 429:
+                        retry_after = exc.response.headers.get("Retry-After") if exc.response is not None else None
+                        wait_seconds = float(retry_after) if retry_after else 30 * (attempt + 1)
+                        self.logger.warning(
+                            "kline request rate limited symbol=%s interval=%s attempt=%s sleep=%ss",
+                            symbol,
+                            interval,
+                            attempt + 1,
+                            wait_seconds,
+                        )
+                        time.sleep(wait_seconds)
+                    else:
+                        self.logger.warning(
+                            "kline request failed symbol=%s interval=%s attempt=%s",
+                            symbol,
+                            interval,
+                            attempt + 1,
+                            exc_info=True,
+                        )
+                        time.sleep(min(4, attempt + 1))
+                    continue
                 except Exception:
                     self.logger.warning(
                         "kline request failed symbol=%s interval=%s attempt=%s",
@@ -425,7 +460,7 @@ class MarketPoolService:
         def load_one(symbol: str) -> tuple[str, pd.DataFrame | None]:
             return symbol, self._fetch_hourly_frame(symbol, start, end)
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=KLINE_BACKFILL_WORKERS) as executor:
             futures = [executor.submit(load_one, symbol) for symbol in symbols]
             for idx, future in enumerate(concurrent.futures.as_completed(futures), start=1):
                 symbol, df = future.result()
@@ -620,7 +655,7 @@ class MarketPoolService:
     def run_update(self, trigger: str = "manual", run_at: datetime | None = None) -> dict[str, Any]:
         run_at = ensure_local(run_at) or self._latest_schedule_time(now_local())
         existing = self._history_item_for_run_at(run_at)
-        if existing is not None:
+        if existing is not None and existing.get("top_movers"):
             return existing
         movers = self.fetch_top_movers_at(run_at, limit=10)
         return self._apply_update(movers, trigger, run_at)
